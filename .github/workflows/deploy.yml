@@ -1,0 +1,78 @@
+name: Deploy suitberry.com
+
+# Public satellite publisher (free unlimited Actions), same pattern as
+# rankpilotai-blog-publisher: the private uludagv-alt/suitberry repo is cloned
+# with a read-only deploy key, then the static site is deployed to Cloudflare
+# Workers. The cloud writer routine pushes new blog posts ~01:40 UTC; the
+# 03:00 UTC run publishes them, the 09:00 UTC run is an idempotent safety net.
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write # only for the keepalive heartbeat commit below
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone private suitberry repo (read-only deploy key)
+        env:
+          SSH_KEY: ${{ secrets.SUITBERRY_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # GitHub's published host key, pinned (no TOFU, no network dependency)
+          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > ~/.ssh/known_hosts
+          git clone --depth 1 git@github.com:uludagv-alt/suitberry.git repo
+          # key is only needed for the clone; remove before any npm code runs
+          rm -f ~/.ssh/id_ed25519
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Deploy to Cloudflare Workers
+        working-directory: repo
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npx wrangler@4.112.0 deploy
+
+      - name: IndexNow ping (Bing/Yandex)
+        working-directory: repo
+        continue-on-error: true # site is already live; a ping-API hiccup must not red-flag the run
+        run: node blog/indexnow.mjs
+
+      # GitHub disables cron workflows in public repos after 60 days without
+      # repo activity; refresh with a heartbeat commit when the last push is
+      # older than 25 days. always() so persistent deploy failures still
+      # keep the schedule alive (dead cron would hide the failures entirely).
+      - name: Keepalive against 60-day cron auto-disable
+        if: ${{ always() && github.event_name == 'schedule' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          last=$(gh api repos/${{ github.repository }} -q .pushed_at || true)
+          if [ -n "$last" ]; then
+            age=$(( ( $(date +%s) - $(date -d "$last" +%s) ) / 86400 ))
+          else
+            age=999
+          fi
+          echo "last push: ${last:-unknown} (${age}d ago)"
+          if [ "$age" -ge 25 ]; then
+            git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" self
+            cd self
+            date -u +%FT%TZ > .heartbeat
+            git add .heartbeat
+            git -c user.name=keepalive -c user.email=keepalive@users.noreply.github.com commit -m "keepalive heartbeat"
+            git push
+          fi
